@@ -1,7 +1,7 @@
 line_follower_node:
   ros__parameters:
-    camera_topic: /camera/image_raw
-    cmd_vel_topic: /cmd_vel
+    camera_topic: /robot6/camera/image_raw
+    cmd_vel_topic: /robot6/cmd_vel
     debug_image_topic: /camera/line_debug
     processing_rate_hz: 15.0
 
