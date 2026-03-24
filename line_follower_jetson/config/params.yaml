@@ -1,0 +1,40 @@
+line_follower_node:
+  ros__parameters:
+    camera_topic: /camera/image_raw
+    cmd_vel_topic: /cmd_vel
+    debug_image_topic: /camera/line_debug
+    processing_rate_hz: 15.0
+
+    # Control PID segun la seccion 3 del PDF Tema 6.
+    Kp: 0.0045
+    Ki: 0.0002
+    Kd: 0.0020
+    integral_limit: 3000.0
+
+    linear_speed: 0.12
+    reduced_linear_speed: 0.05
+    max_angular_speed: 1.5
+
+    # Vision artificial segun seccion 2 y seccion 3 del PDF Tema 6.
+    line_color: black
+    adaptive_threshold: true
+    threshold_value: 120
+    use_canny: false
+    use_hough_assist: true
+    blur_kernel_size: 5
+    canny_low_threshold: 50
+    canny_high_threshold: 150
+    roi_vertical_start: 0.60
+    roi_vertical_end: 1.00
+    min_contour_area: 700.0
+    ambiguity_ratio_threshold: 0.35
+    max_center_jump_px: 140.0
+
+    # Robustez frente a perdida de linea, cruces y cambios de iluminacion.
+    line_loss_limit: 6
+    image_timeout_sec: 0.5
+
+    # Debug.
+    publish_debug_image: true
+    show_debug_window: false
+    debug_log_interval_sec: 1.0
