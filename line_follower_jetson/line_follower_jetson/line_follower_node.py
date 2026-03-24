@@ -51,6 +51,7 @@ class LineFollowerNode(Node):
                 ('line_color', 'black'),
                 ('use_canny', False),
                 ('use_hough_assist', True),
+                ('hough_center_band_ratio', 0.55),
                 ('roi_vertical_start', 0.60),
                 ('roi_vertical_end', 1.00),
                 ('blur_kernel_size', 5),
@@ -106,6 +107,7 @@ class LineFollowerNode(Node):
         self.line_color = str(self.get_parameter('line_color').value).lower().strip()
         self.use_canny = bool(self.get_parameter('use_canny').value)
         self.use_hough_assist = bool(self.get_parameter('use_hough_assist').value)
+        self.hough_center_band_ratio = float(self.get_parameter('hough_center_band_ratio').value)
         self.roi_vertical_start = float(self.get_parameter('roi_vertical_start').value)
         self.roi_vertical_end = float(self.get_parameter('roi_vertical_end').value)
         self.blur_kernel_size = int(self.get_parameter('blur_kernel_size').value)
@@ -127,6 +129,7 @@ class LineFollowerNode(Node):
 
         self.roi_vertical_start = min(max(self.roi_vertical_start, 0.0), 0.95)
         self.roi_vertical_end = min(max(self.roi_vertical_end, self.roi_vertical_start + 0.05), 1.0)
+        self.hough_center_band_ratio = min(max(self.hough_center_band_ratio, 0.15), 1.0)
 
     def _on_parameters_changed(self, params):
         for param in params:
@@ -138,6 +141,8 @@ class LineFollowerNode(Node):
                 return SetParametersResult(successful=False, reason='blur_kernel_size must be >= 1')
             if param.name == 'line_color' and str(param.value).lower() not in {'black', 'white'}:
                 return SetParametersResult(successful=False, reason='line_color must be black or white')
+            if param.name == 'hough_center_band_ratio' and not (0.0 < float(param.value) <= 1.0):
+                return SetParametersResult(successful=False, reason='hough_center_band_ratio must be in (0, 1]')
 
         self._load_parameters()
         new_period = 1.0 / max(self.processing_rate_hz, 1.0)
@@ -196,9 +201,6 @@ class LineFollowerNode(Node):
         gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
         blurred = cv2.GaussianBlur(gray, (self.blur_kernel_size, self.blur_kernel_size), 0)
 
-        # Vision artificial con camara CMOS segun la seccion 2 del PDF Tema 6:
-        # se aprovecha la flexibilidad para seguir lineas claras u oscuras y adaptarse
-        # mejor a cruces, bifurcaciones y cambios de iluminacion que sensores discretos.
         if self.adaptive_threshold:
             binary = cv2.adaptiveThreshold(
                 blurred,
@@ -218,10 +220,7 @@ class LineFollowerNode(Node):
         binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
         binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
 
-        edges = None
-        if self.use_canny:
-            # Deteccion de bordes Canny/Sobel descrita en la seccion 3 del PDF Tema 6.
-            edges = cv2.Canny(binary, self.canny_low_threshold, self.canny_high_threshold)
+        edges = cv2.Canny(binary, self.canny_low_threshold, self.canny_high_threshold)
 
         detection = self._detect_line(binary, edges)
         debug_frame = frame.copy()
@@ -230,7 +229,7 @@ class LineFollowerNode(Node):
 
         if detection is None:
             self.line_loss_count += 1
-            self._handle_line_loss(debug_frame, roi_top, width, height, stamp)
+            self._handle_line_loss(debug_frame, roi_top, width, stamp)
             return
 
         line_center_x, confidence, method_name, contour_area = detection
@@ -270,54 +269,32 @@ class LineFollowerNode(Node):
         self._log_status(error, angular_command, confidence, method_name)
 
     def _detect_line(self, binary: np.ndarray, edges: np.ndarray):
+        hough_result = self._detect_with_hough(binary, edges)
+        if hough_result is not None:
+            return hough_result
+
         contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            return self._detect_with_hough(binary, edges)
+            return None
 
         contours = sorted(contours, key=cv2.contourArea, reverse=True)
         best_contour = contours[0]
         best_area = cv2.contourArea(best_contour)
         if best_area < self.min_contour_area:
-            return self._detect_with_hough(binary, edges)
+            return None
 
         moments = cv2.moments(best_contour)
         if moments['m00'] <= 0.0:
-            return self._detect_with_hough(binary, edges)
+            return None
 
         cx = moments['m10'] / moments['m00']
-        total_foreground = float(cv2.countNonZero(binary))
-        area_ratio = 0.0 if total_foreground <= 0.0 else best_area / total_foreground
-        confidence = float(np.clip(best_area / max(self.min_contour_area * 4.0, 1.0), 0.0, 1.0))
-
-        if len(contours) > 1:
-            second_area = cv2.contourArea(contours[1])
-            if best_area > 0.0 and second_area / best_area > self.ambiguity_ratio_threshold:
-                # En cruces o bifurcaciones, la estimacion por Hough ayuda a mantener una
-                # referencia de direccion tal y como se describe en la seccion 3 del PDF.
-                hough_result = self._detect_with_hough(binary, edges)
-                if hough_result is not None:
-                    return hough_result
-                confidence *= 0.7
-
-        if self.last_line_center_x is not None and abs(cx - self.last_line_center_x) > self.max_center_jump_px:
-            hough_result = self._detect_with_hough(binary, edges)
-            if hough_result is not None:
-                return hough_result
-            confidence *= 0.6
-
-        if area_ratio > 0.70:
-            confidence *= 0.5
-
-        return float(cx), confidence, 'centroid', best_area
+        confidence = float(np.clip(best_area / max(self.min_contour_area * 4.0, 1.0), 0.0, 0.45))
+        return float(cx), confidence, 'centroid_fallback', best_area
 
     def _detect_with_hough(self, binary: np.ndarray, edges: np.ndarray):
         if not self.use_hough_assist:
             return None
 
-        if edges is None:
-            edges = cv2.Canny(binary, self.canny_low_threshold, self.canny_high_threshold)
-
-        # Transformada de Hough para lineas segun la seccion 3 del PDF Tema 6.
         lines = cv2.HoughLinesP(
             edges,
             rho=1,
@@ -329,23 +306,57 @@ class LineFollowerNode(Node):
         if lines is None:
             return None
 
-        weighted_centers = []
-        weights = []
+        image_height, image_width = binary.shape[:2]
+        image_center_x = image_width * 0.5
+        band_half_width = max(1.0, 0.5 * image_width * self.hough_center_band_ratio)
+        band_left = image_center_x - band_half_width
+        band_right = image_center_x + band_half_width
+
+        preferred_centers = []
+        preferred_weights = []
+        fallback_centers = []
+        fallback_weights = []
+
         for segment in lines[:, 0]:
             x1, y1, x2, y2 = [float(v) for v in segment]
             length = math.hypot(x2 - x1, y2 - y1)
             if length < 10.0:
                 continue
-            center_x = 0.5 * (x1 + x2)
-            weighted_centers.append(center_x)
-            weights.append(length)
 
+            if y1 >= y2:
+                lower_x = x1
+                lower_y = y1
+            else:
+                lower_x = x2
+                lower_y = y2
+
+            center_x = 0.5 * (x1 + x2)
+            bottom_score = float(np.clip(lower_y / max(image_height - 1.0, 1.0), 0.0, 1.0))
+            center_distance = abs(lower_x - image_center_x) / max(image_center_x, 1.0)
+            center_score = float(np.clip(1.0 - center_distance, 0.0, 1.0))
+            weight = length * (0.65 + 0.35 * bottom_score) * (0.40 + 0.60 * center_score)
+
+            fallback_centers.append(center_x)
+            fallback_weights.append(weight)
+
+            if band_left <= lower_x <= band_right:
+                preferred_centers.append(center_x)
+                preferred_weights.append(weight)
+
+        weights = preferred_weights if preferred_weights else fallback_weights
+        centers = preferred_centers if preferred_centers else fallback_centers
         if not weights:
             return None
 
-        cx = float(np.average(weighted_centers, weights=weights))
-        confidence = float(np.clip(sum(weights) / max(binary.shape[1] * 1.5, 1.0), 0.0, 0.8))
-        return cx, confidence, 'hough', float(sum(weights))
+        cx = float(np.average(centers, weights=weights))
+        confidence = float(np.clip(sum(weights) / max(image_width * 2.0, 1.0), 0.0, 0.85))
+        if not preferred_weights:
+            confidence *= 0.6
+
+        if self.last_line_center_x is not None and abs(cx - self.last_line_center_x) > self.max_center_jump_px:
+            confidence *= 0.7
+
+        return cx, confidence, 'hough_front_center', float(sum(weights))
 
     def _smooth_center(self, center_x: float) -> float:
         self.recent_centers.append(center_x)
@@ -362,8 +373,6 @@ class LineFollowerNode(Node):
         return dt
 
     def _compute_pid(self, error: float, dt: float) -> float:
-        # Control PID discreto segun la seccion 3 del PDF Tema 6:
-        # u(t) = Kp*e(t) + Ki*sum(e(i))*dt + Kd*(e(n)-e(n-1))/dt
         self.integral_error += error * dt
         self.integral_error = float(
             np.clip(self.integral_error, -self.integral_limit, self.integral_limit)
@@ -372,7 +381,7 @@ class LineFollowerNode(Node):
         self.previous_error = error
         return (self.kp * error) + (self.ki * self.integral_error) + (self.kd * derivative)
 
-    def _handle_line_loss(self, debug_frame, roi_top: int, width: int, height: int, stamp) -> None:
+    def _handle_line_loss(self, debug_frame, roi_top: int, width: int, stamp) -> None:
         twist = Twist()
         if self.line_loss_count < self.line_loss_limit and self.last_line_center_x is not None:
             twist.linear.x = float(self.reduced_linear_speed)
@@ -416,7 +425,17 @@ class LineFollowerNode(Node):
         roi_height = binary.shape[0]
         line_x_int = int(round(line_center_x))
         image_x_int = int(round(image_center_x))
+        band_half_width = max(1.0, 0.5 * debug_frame.shape[1] * self.hough_center_band_ratio)
+        band_left = int(round(image_center_x - band_half_width))
+        band_right = int(round(image_center_x + band_half_width))
 
+        cv2.rectangle(
+            debug_frame,
+            (band_left, roi_top),
+            (band_right, roi_top + roi_height),
+            (255, 0, 255),
+            1,
+        )
         cv2.line(
             debug_frame,
             (image_x_int, roi_top),
@@ -488,6 +507,8 @@ class LineFollowerNode(Node):
             self.integral_error = 0.0
             self.previous_error = 0.0
             self.recent_centers.clear()
+            self.last_line_center_x = None
+            self.line_loss_count = 0
 
     def destroy_node(self):
         if self.show_debug_window:

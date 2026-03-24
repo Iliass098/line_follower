@@ -21,6 +21,7 @@ line_follower_node:
     threshold_value: 120
     use_canny: false
     use_hough_assist: true
+    hough_center_band_ratio: 0.55
     blur_kernel_size: 5
     canny_low_threshold: 50
     canny_high_threshold: 150
